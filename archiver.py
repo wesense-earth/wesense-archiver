@@ -546,6 +546,8 @@ class WeSenseArchiver:
                 verified.append(reading)
             except Exception:
                 failed += 1
+                if failed <= 1:
+                    logger.warning("Signature mismatch debug — reconstructed payload: %s", payload.decode())
                 logger.debug("Signature verification failed for reading %s", reading.get("reading_id", "?"))
 
         return verified, failed
