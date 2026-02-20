@@ -460,6 +460,7 @@ class WeSenseArchiver:
                 data_source,
                 board_model,
                 node_name,
+                transport_type,
                 ingester_id,
                 key_version,
                 signature
@@ -475,21 +476,21 @@ class WeSenseArchiver:
             "device_id", "timestamp", "reading_type", "value",
             "unit", "latitude", "longitude", "altitude", "geo_country",
             "geo_subdivision", "data_source", "board_model", "node_name",
-            "ingester_id", "key_version", "signature",
+            "transport_type", "ingester_id", "key_version", "signature",
         ]
 
         readings = []
         for row in result.result_rows:
             reading = dict(zip(columns, row))
-            # Convert datetime to unix int for reading_id, then to ISO string
+            # Preserve unix timestamp for signature verification and reading_id
             ts = reading["timestamp"]
             if hasattr(ts, "timestamp"):
-                ts_unix = int(ts.timestamp())
+                reading["_ts_unix"] = int(ts.timestamp())
                 reading["timestamp"] = ts.isoformat()
             else:
-                ts_unix = int(datetime.fromisoformat(str(ts)).timestamp())
+                reading["_ts_unix"] = int(datetime.fromisoformat(str(ts)).timestamp())
             reading["reading_id"] = generate_reading_id(
-                reading["device_id"], ts_unix, reading["reading_type"], reading["value"]
+                reading["device_id"], reading["_ts_unix"], reading["reading_type"], reading["value"]
             )
             readings.append(reading)
 
@@ -525,13 +526,19 @@ class WeSenseArchiver:
                 verified.append(reading)
                 continue
 
-            # Reconstruct the payload that was signed: the reading dict as JSON
-            # (sort_keys=True for deterministic ordering, matching the signer)
+            # Reconstruct the exact payload that was signed by the ingester:
+            # same 8 fields, with timestamp as unix int, sorted keys
             payload_dict = {
-                k: v for k, v in reading.items()
-                if k not in ("signature", "ingester_id", "key_version")
+                "data_source": reading.get("data_source", "").lower(),
+                "device_id": reading["device_id"],
+                "latitude": reading["latitude"],
+                "longitude": reading["longitude"],
+                "reading_type": reading["reading_type"],
+                "timestamp": reading["_ts_unix"],
+                "transport_type": reading.get("transport_type", ""),
+                "value": reading["value"],
             }
-            payload = json.dumps(payload_dict, sort_keys=True, default=str).encode()
+            payload = json.dumps(payload_dict, sort_keys=True).encode()
 
             try:
                 signature_bytes = bytes.fromhex(signature_hex)
@@ -576,6 +583,7 @@ class WeSenseArchiver:
             ("data_source", pa.string()),
             ("board_model", pa.string()),
             ("node_name", pa.string()),
+            ("transport_type", pa.string()),
             ("ingester_id", pa.string()),
             ("key_version", pa.uint32()),
             ("signature", pa.string()),
