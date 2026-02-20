@@ -11,6 +11,8 @@
 
 FROM python:3.11-slim
 
+LABEL org.opencontainers.image.source=https://github.com/wesense-earth/wesense-archiver
+
 WORKDIR /app
 
 # Copy dependency files first for better layer caching
