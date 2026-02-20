@@ -253,6 +253,7 @@ class WeSenseArchiver:
                 max(toDate(timestamp))
             FROM sensor_readings
             WHERE signature != ''
+              AND received_via = 'local'
         """
         result = self._ch_client.query(query)
         if not result.result_rows or result.result_rows[0][0] is None:
@@ -270,6 +271,7 @@ class WeSenseArchiver:
             FROM sensor_readings
             WHERE toDate(timestamp) BETWEEN {start:String} AND {end:String}
               AND signature != ''
+              AND received_via = 'local'
             ORDER BY geo_country
         """
         result = self._ch_client.query(query, parameters={
@@ -468,6 +470,7 @@ class WeSenseArchiver:
             WHERE toDate(timestamp) = {period:String}
               AND geo_country = {region:String}
               AND signature != ''
+              AND received_via = 'local'
             ORDER BY device_id, reading_type, timestamp
         """
         result = self._ch_client.query(query, parameters={"period": period, "region": region})
@@ -547,11 +550,11 @@ class WeSenseArchiver:
             except Exception:
                 failed += 1
                 if failed <= 1:
-                    logger.warning("Signature mismatch debug — ingester=%s key_v=%s", ingester_id, key_version)
-                    logger.warning("Signature mismatch debug — payload bytes: %s", payload.hex())
-                    logger.warning("Signature mismatch debug — payload text:  %s", payload.decode())
-                    logger.warning("Signature mismatch debug — value types: %s",
-                        {k: type(v).__name__ for k, v in payload_dict.items()})
+                    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+                    pub_bytes = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+                    logger.warning("Signature mismatch debug — ingester=%s key_v=%s pubkey=%s", ingester_id, key_version, pub_bytes.hex()[:16])
+                    logger.warning("Signature mismatch debug — sig=%s", signature_hex[:32])
+                    logger.warning("Signature mismatch debug — payload: %s", payload.decode())
                 logger.debug("Signature verification failed for reading %s", reading.get("reading_id", "?"))
 
         return verified, failed
