@@ -547,7 +547,11 @@ class WeSenseArchiver:
             except Exception:
                 failed += 1
                 if failed <= 1:
-                    logger.warning("Signature mismatch debug — reconstructed payload: %s", payload.decode())
+                    logger.warning("Signature mismatch debug — ingester=%s key_v=%s", ingester_id, key_version)
+                    logger.warning("Signature mismatch debug — payload bytes: %s", payload.hex())
+                    logger.warning("Signature mismatch debug — payload text:  %s", payload.decode())
+                    logger.warning("Signature mismatch debug — value types: %s",
+                        {k: type(v).__name__ for k, v in payload_dict.items()})
                 logger.debug("Signature verification failed for reading %s", reading.get("reading_id", "?"))
 
         return verified, failed
