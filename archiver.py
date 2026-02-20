@@ -529,7 +529,7 @@ class WeSenseArchiver:
             # Reconstruct the exact payload that was signed by the ingester:
             # same 8 fields, with timestamp as unix int, sorted keys
             payload_dict = {
-                "data_source": reading.get("data_source", "").lower(),
+                "data_source": reading.get("data_source", ""),
                 "device_id": reading["device_id"],
                 "latitude": reading["latitude"],
                 "longitude": reading["longitude"],
