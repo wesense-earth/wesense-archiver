@@ -38,6 +38,7 @@ except ImportError:
 try:
     from wesense_ingester.signing.keys import IngesterKeyManager, KeyConfig
     from wesense_ingester.signing.trust import TrustStore
+    from wesense_ingester.ids.reading_id import generate_reading_id
 
     _SIGNING_AVAILABLE = True
 except ImportError:
@@ -446,7 +447,6 @@ class WeSenseArchiver:
         """Query ClickHouse for signed readings for a country/day."""
         query = """
             SELECT
-                reading_id,
                 device_id,
                 timestamp,
                 reading_type,
@@ -457,8 +457,8 @@ class WeSenseArchiver:
                 altitude,
                 geo_country,
                 geo_subdivision,
-                source,
-                board_type,
+                data_source,
+                board_model,
                 node_name,
                 ingester_id,
                 key_version,
@@ -467,23 +467,30 @@ class WeSenseArchiver:
             WHERE toDate(timestamp) = {period:String}
               AND geo_country = {region:String}
               AND signature != ''
-            ORDER BY reading_id
+            ORDER BY device_id, reading_type, timestamp
         """
         result = self._ch_client.query(query, parameters={"period": period, "region": region})
 
         columns = [
-            "reading_id", "device_id", "timestamp", "reading_type", "value",
+            "device_id", "timestamp", "reading_type", "value",
             "unit", "latitude", "longitude", "altitude", "geo_country",
-            "geo_subdivision", "source", "board_type", "node_name",
+            "geo_subdivision", "data_source", "board_model", "node_name",
             "ingester_id", "key_version", "signature",
         ]
 
         readings = []
         for row in result.result_rows:
             reading = dict(zip(columns, row))
-            # Convert datetime to ISO format string for JSON serialization
-            if hasattr(reading["timestamp"], "isoformat"):
-                reading["timestamp"] = reading["timestamp"].isoformat()
+            # Convert datetime to unix int for reading_id, then to ISO string
+            ts = reading["timestamp"]
+            if hasattr(ts, "timestamp"):
+                ts_unix = int(ts.timestamp())
+                reading["timestamp"] = ts.isoformat()
+            else:
+                ts_unix = int(datetime.fromisoformat(str(ts)).timestamp())
+            reading["reading_id"] = generate_reading_id(
+                reading["device_id"], ts_unix, reading["reading_type"], reading["value"]
+            )
             readings.append(reading)
 
         return readings
@@ -566,8 +573,8 @@ class WeSenseArchiver:
             ("altitude", pa.float64()),
             ("geo_country", pa.string()),
             ("geo_subdivision", pa.string()),
-            ("source", pa.string()),
-            ("board_type", pa.string()),
+            ("data_source", pa.string()),
+            ("board_model", pa.string()),
             ("node_name", pa.string()),
             ("ingester_id", pa.string()),
             ("key_version", pa.uint32()),
