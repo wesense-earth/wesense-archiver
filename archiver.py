@@ -549,13 +549,7 @@ class WeSenseArchiver:
                 verified.append(reading)
             except Exception:
                 failed += 1
-                if failed <= 1:
-                    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-                    pub_bytes = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
-                    logger.warning("Signature mismatch debug — ingester=%s key_v=%s pubkey=%s", ingester_id, key_version, pub_bytes.hex()[:16])
-                    logger.warning("Signature mismatch debug — sig=%s", signature_hex[:32])
-                    logger.warning("Signature mismatch debug — payload: %s", payload.decode())
-                logger.debug("Signature verification failed for reading %s", reading.get("reading_id", "?"))
+                logger.debug("Signature verification failed for reading %s (ingester=%s)", reading.get("reading_id", "?"), ingester_id)
 
         return verified, failed
 
