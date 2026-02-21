@@ -203,6 +203,12 @@ class WeSenseArchiver:
             logger.warning("OrbitDB unreachable at %s — skipping cycle", self.config.orbitdb_url)
             return
 
+        # Clear staging directory to remove leftovers from previous failed uploads
+        staging = Path(self.config.staging_dir)
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True, exist_ok=True)
+
         # Don't archive today — incomplete data would change readings_hash
         yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
 
