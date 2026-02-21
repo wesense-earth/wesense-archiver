@@ -1,14 +1,25 @@
 """
-Backfill signatures for historical unsigned readings.
+Backfill and fix signatures for historical readings.
 
-Retroactively signs local readings that were ingested before Ed25519 signing
-was deployed. Uses the archiver's own key to attest that this station
-ingested the data.
+Two modes:
+  --mode unsigned (default)
+      Signs local readings where signature = ''.
+      For data ingested before Ed25519 signing was deployed.
+
+  --mode resign
+      Re-signs local readings that already have signatures, using the
+      archiver's own key and the ClickHouse values. Fixes mismatches
+      where the original ingester signed with a different payload
+      (e.g. data_source case mismatch) so the archiver can verify them.
+
+Uses the archiver's own key to attest that this station ingested the data.
 
 Runs inside the archiver container:
     docker exec wesense-archiver python backfill_signatures.py
+    docker exec wesense-archiver python backfill_signatures.py --mode resign
 
-Safe to re-run — only updates rows where signature = ''.
+Safe to re-run — Ed25519 is deterministic, so re-signing with the same
+key and payload produces the same signature.
 """
 
 import argparse
@@ -82,12 +93,13 @@ def sign_row(row, private_key):
     return signature.hex()
 
 
-def get_date_range(client):
-    """Get the date range of unsigned local readings."""
-    result = client.query("""
+def get_date_range(client, resign=False):
+    """Get the date range of target local readings."""
+    sig_condition = "signature != ''" if resign else "signature = ''"
+    result = client.query(f"""
         SELECT min(toDate(timestamp)), max(toDate(timestamp))
         FROM sensor_readings
-        WHERE signature = '' AND received_via = 'local'
+        WHERE {sig_condition} AND received_via = 'local'
     """)
     if not result.result_rows or result.result_rows[0][0] is None:
         return None
@@ -97,16 +109,17 @@ def get_date_range(client):
     return start, end
 
 
-def backfill_day(client, day, private_key, ingester_id, key_version):
-    """Sign and re-insert all unsigned local readings for a single day."""
+def backfill_day(client, day, private_key, ingester_id, key_version, resign=False):
+    """Sign and re-insert readings for a single day."""
     day_str = day.isoformat()
+    sig_condition = "signature != ''" if resign else "signature = ''"
 
     columns_sql = ", ".join(ALL_COLUMNS)
     result = client.query(f"""
         SELECT {columns_sql}
         FROM sensor_readings
         WHERE toDate(timestamp) = {{day:String}}
-          AND signature = ''
+          AND {sig_condition}
           AND received_via = 'local'
     """, parameters={"day": day_str})
 
@@ -129,7 +142,9 @@ def backfill_day(client, day, private_key, ingester_id, key_version):
 
 def main():
     parser = argparse.ArgumentParser(description="Backfill Ed25519 signatures for historical readings")
-    parser.add_argument("--start-date", help="Start date (YYYY-MM-DD), default: earliest unsigned")
+    parser.add_argument("--mode", choices=["unsigned", "resign"], default="unsigned",
+                        help="unsigned: sign rows with no signature; resign: re-sign rows with existing signatures")
+    parser.add_argument("--start-date", help="Start date (YYYY-MM-DD), default: earliest in range")
     parser.add_argument("--end-date", help="End date (YYYY-MM-DD), default: yesterday")
     parser.add_argument("--key-dir", default=os.environ.get("KEY_DIR", "/app/data/keys"),
                         help="Directory containing ingester_key.pem")
@@ -140,11 +155,15 @@ def main():
     parser.add_argument("--ch-database", default=os.environ.get("CLICKHOUSE_DATABASE", "wesense"))
     args = parser.parse_args()
 
+    resign = args.mode == "resign"
+    mode_label = "re-signing" if resign else "backfilling unsigned"
+
     # Load signing key
     config = KeyConfig(key_dir=args.key_dir, key_file="ingester_key.pem")
     key_manager = IngesterKeyManager(config=config)
     key_manager.load_or_generate()
     logger.info("Signing identity: %s (version %d)", key_manager.ingester_id, key_manager.key_version)
+    logger.info("Mode: %s", mode_label)
 
     # Connect to ClickHouse
     client = clickhouse_connect.get_client(
@@ -157,9 +176,9 @@ def main():
     logger.info("Connected to ClickHouse at %s:%d/%s", args.ch_host, args.ch_port, args.ch_database)
 
     # Determine date range
-    date_range = get_date_range(client)
+    date_range = get_date_range(client, resign=resign)
     if not date_range:
-        logger.info("No unsigned local readings found")
+        logger.info("No %s local readings found", "signed" if resign else "unsigned")
         return
 
     ch_start, ch_end = date_range
@@ -178,7 +197,7 @@ def main():
         return
 
     total_days = (ch_end - ch_start).days + 1
-    logger.info("Backfilling %s to %s (%d days)", ch_start, ch_end, total_days)
+    logger.info("%s %s to %s (%d days)", mode_label.capitalize(), ch_start, ch_end, total_days)
 
     total_signed = 0
     current = ch_start
@@ -186,18 +205,22 @@ def main():
 
     while current <= ch_end:
         day_num += 1
-        count = backfill_day(client, current, key_manager.private_key, key_manager.ingester_id, key_manager.key_version)
+        count = backfill_day(client, current, key_manager.private_key, key_manager.ingester_id, key_manager.key_version, resign=resign)
         if count > 0:
             total_signed += count
-            logger.info("[%d/%d] %s: signed %d readings (total: %d)", day_num, total_days, current, count, total_signed)
+            logger.info("[%d/%d] %s: %s %d readings (total: %d)", day_num, total_days, current, "re-signed" if resign else "signed", count, total_signed)
         current += timedelta(days=1)
 
-    logger.info("Backfill complete: %d readings signed across %d days", total_signed, total_days)
+    logger.info("Complete: %d readings %s across %d days", total_signed, "re-signed" if resign else "signed", total_days)
 
     if total_signed > 0:
-        logger.info("Running OPTIMIZE to merge signed rows...")
-        client.command("OPTIMIZE TABLE sensor_readings FINAL")
-        logger.info("Done")
+        logger.info("Running OPTIMIZE to merge rows...")
+        try:
+            client.command("OPTIMIZE TABLE sensor_readings FINAL")
+            logger.info("Done")
+        except Exception as e:
+            logger.warning("OPTIMIZE failed (may need admin privileges): %s", e)
+            logger.info("Rows were inserted successfully — OPTIMIZE can be run later by an admin")
 
 
 if __name__ == "__main__":

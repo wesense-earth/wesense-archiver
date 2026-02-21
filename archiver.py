@@ -181,60 +181,46 @@ class WeSenseArchiver:
     def archive_cycle(self):
         """Run a gap-aware archive cycle.
 
-        1. Query ClickHouse for the date range of signed readings
-        2. For each country, check which dates are already in the IPFS tree
-        3. Archive any missing dates (oldest first)
+        1. Query ClickHouse for countries with signed readings
+        2. For each country, get the actual dates with data
+        3. Subtract already-archived dates from the IPFS tree
+        4. Archive any missing dates (oldest first)
         """
         logger.info("Starting archive cycle...")
 
-        # Get available date range from ClickHouse
-        date_range = self._get_available_date_range()
-        if not date_range:
-            logger.info("No signed readings in ClickHouse — nothing to archive")
-            return
-
-        ch_start, ch_end = date_range
-
-        # Clamp start to configured start_date if set
-        if self.config.start_date:
-            configured_start = date.fromisoformat(self.config.start_date)
-            ch_start = max(ch_start, configured_start)
-
         # Don't archive today — incomplete data would change readings_hash
         yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
-        ch_end = min(ch_end, yesterday)
 
-        if ch_start > ch_end:
-            logger.info("No complete days to archive (start=%s, end=%s)", ch_start, ch_end)
-            return
+        # Clamp start to configured start_date if set
+        start_date = None
+        if self.config.start_date:
+            start_date = date.fromisoformat(self.config.start_date)
 
-        logger.info("Archivable range: %s to %s", ch_start, ch_end)
-
-        # Get all countries with signed data in the range
-        countries = self._get_countries_for_range(ch_start, ch_end)
+        # Get all countries with signed data
+        countries = self._get_countries_with_data(start_date, yesterday)
         if self.config.regions:
             countries = [c for c in countries if c in self.config.regions]
 
         if not countries:
-            logger.info("No countries with signed readings in range")
+            logger.info("No countries with signed readings to archive")
             return
 
-        # Build complete set of dates in the range
-        all_dates = set()
-        d = ch_start
-        while d <= ch_end:
-            all_dates.add(d.isoformat())
-            d += timedelta(days=1)
+        logger.info("Countries with signed data: %s", ", ".join(countries))
 
         for country in countries:
-            archived = self._get_archived_dates(country)
-            missing = sorted(all_dates - archived)
-
-            if not missing:
-                logger.info("%s: fully archived (%d days)", country, len(all_dates))
+            # Query only the dates that actually have data for this country
+            data_dates = self._get_dates_with_data(country, start_date, yesterday)
+            if not data_dates:
                 continue
 
-            logger.info("%s: %d missing of %d days — archiving...", country, len(missing), len(all_dates))
+            archived = self._get_archived_dates(country)
+            missing = sorted(data_dates - archived)
+
+            if not missing:
+                logger.info("%s: fully archived (%d days)", country, len(data_dates))
+                continue
+
+            logger.info("%s: %d to archive of %d total days", country, len(missing), len(data_dates))
 
             for i, period in enumerate(missing, 1):
                 try:
@@ -245,40 +231,51 @@ class WeSenseArchiver:
 
         logger.info("Archive cycle complete")
 
-    def _get_available_date_range(self) -> tuple[date, date] | None:
-        """Get the date range of signed readings in ClickHouse."""
-        query = """
-            SELECT
-                min(toDate(timestamp)),
-                max(toDate(timestamp))
-            FROM sensor_readings
-            WHERE signature != ''
-              AND received_via = 'local'
-        """
-        result = self._ch_client.query(query)
-        if not result.result_rows or result.result_rows[0][0] is None:
-            return None
-        row = result.result_rows[0]
-        # clickhouse-connect returns date objects
-        start = row[0] if isinstance(row[0], date) else date.fromisoformat(str(row[0]))
-        end = row[1] if isinstance(row[1], date) else date.fromisoformat(str(row[1]))
-        return start, end
+    def _get_countries_with_data(self, start: date | None, end: date) -> list[str]:
+        """Get list of countries with signed local readings."""
+        conditions = ["signature != ''", "received_via = 'local'", "toDate(timestamp) <= {end:String}"]
+        params = {"end": end.isoformat()}
+        if start:
+            conditions.append("toDate(timestamp) >= {start:String}")
+            params["start"] = start.isoformat()
 
-    def _get_countries_for_range(self, start: date, end: date) -> list[str]:
-        """Get list of countries with signed readings in a date range."""
-        query = """
+        query = f"""
             SELECT DISTINCT geo_country
             FROM sensor_readings
-            WHERE toDate(timestamp) BETWEEN {start:String} AND {end:String}
-              AND signature != ''
-              AND received_via = 'local'
+            WHERE {' AND '.join(conditions)}
             ORDER BY geo_country
         """
-        result = self._ch_client.query(query, parameters={
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-        })
+        result = self._ch_client.query(query, parameters=params)
         return [row[0] for row in result.result_rows if row[0]]
+
+    def _get_dates_with_data(self, country: str, start: date | None, end: date) -> set[str]:
+        """Get the actual dates that have signed readings for a country."""
+        conditions = [
+            "signature != ''",
+            "received_via = 'local'",
+            "geo_country = {country:String}",
+            "toDate(timestamp) <= {end:String}",
+        ]
+        params = {"country": country, "end": end.isoformat()}
+        if start:
+            conditions.append("toDate(timestamp) >= {start:String}")
+            params["start"] = start.isoformat()
+
+        query = f"""
+            SELECT DISTINCT toDate(timestamp) as d
+            FROM sensor_readings
+            WHERE {' AND '.join(conditions)}
+            ORDER BY d
+        """
+        result = self._ch_client.query(query, parameters=params)
+        dates = set()
+        for row in result.result_rows:
+            d = row[0]
+            if isinstance(d, date):
+                dates.add(d.isoformat())
+            else:
+                dates.add(str(d))
+        return dates
 
     def _get_archived_dates(self, country: str) -> set[str]:
         """Check the IPFS tree for already-archived dates for a country.
