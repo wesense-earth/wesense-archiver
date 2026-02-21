@@ -178,15 +178,30 @@ class WeSenseArchiver:
         self._init_trust()
         logger.info("Archiver initialized successfully")
 
+    def _check_orbitdb(self) -> bool:
+        """Check if the OrbitDB service is reachable."""
+        url = f"{self.config.orbitdb_url.rstrip('/')}/health"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status == 200
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+            return False
+
     def archive_cycle(self):
         """Run a gap-aware archive cycle.
 
-        1. Query ClickHouse for countries with signed readings
-        2. For each country, get the actual dates with data
-        3. Subtract already-archived dates from the IPFS tree
-        4. Archive any missing dates (oldest first)
+        1. Check OrbitDB is reachable
+        2. Query ClickHouse for countries with signed readings
+        3. For each country, get the actual dates with data
+        4. Subtract already-archived dates from the IPFS tree
+        5. Archive any missing dates (oldest first)
         """
         logger.info("Starting archive cycle...")
+
+        if not self._check_orbitdb():
+            logger.warning("OrbitDB unreachable at %s — skipping cycle", self.config.orbitdb_url)
+            return
 
         # Don't archive today — incomplete data would change readings_hash
         yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
