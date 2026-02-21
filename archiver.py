@@ -463,7 +463,7 @@ class WeSenseArchiver:
                 ingester_id,
                 key_version,
                 signature
-            FROM sensor_readings
+            FROM sensor_readings FINAL
             WHERE toDate(timestamp) = {period:String}
               AND geo_country = {region:String}
               AND signature != ''
