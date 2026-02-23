@@ -3,10 +3,11 @@ WeSense Archiver — IPFS archive service.
 
 Exports signed readings from ClickHouse, verifies signatures, creates
 deterministic Parquet archives with trust snapshots and signed manifests,
-uploads to IPFS via wesense-orbitdb, and submits attestations.
+uploads to IPFS via Kubo MFS API, publishes IPNS, and submits attestations
+to OrbitDB for multi-archiver consensus.
 
-One archive per country per day. Gap-aware: on each cycle, checks the IPFS
-tree for already-archived dates, compares against ClickHouse, and fills gaps.
+One archive per country per day. Gap-aware: on each cycle, checks the Kubo
+MFS tree for already-archived dates, compares against ClickHouse, and fills gaps.
 """
 
 import base64
@@ -54,6 +55,7 @@ except ImportError:
 
 # HTTP helpers for archive upload (uses stdlib urllib)
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -74,7 +76,10 @@ class ArchiverConfig:
     # Trust
     trust_file: str = "data/trust_list.json"
 
-    # OrbitDB
+    # Kubo (IPFS archive storage)
+    kubo_api_url: str = "http://kubo:5001"
+
+    # OrbitDB (attestations + trust sync only)
     orbitdb_url: str = "http://wesense-orbitdb:5200"
 
     # Staging
@@ -104,6 +109,7 @@ class ArchiverConfig:
             ch_database=os.getenv("CLICKHOUSE_DATABASE", "wesense"),
             key_dir=os.getenv("ZENOH_KEY_DIR", "data/keys"),
             trust_file=os.getenv("TRUST_FILE", "data/trust_list.json"),
+            kubo_api_url=os.getenv("KUBO_API_URL", "http://kubo:5001"),
             orbitdb_url=os.getenv("ORBITDB_URL", "http://wesense-orbitdb:5200"),
             staging_dir=os.getenv("ARCHIVE_STAGING_DIR", "data/staging"),
             interval_hours=int(os.getenv("ARCHIVE_INTERVAL_HOURS", "4")),
@@ -178,10 +184,10 @@ class WeSenseArchiver:
         self._init_trust()
         logger.info("Archiver initialized successfully")
 
-    def _check_orbitdb(self) -> bool:
-        """Check if the OrbitDB service is reachable."""
-        url = f"{self.config.orbitdb_url.rstrip('/')}/health"
-        req = urllib.request.Request(url, method="GET")
+    def _check_kubo(self) -> bool:
+        """Check if the Kubo IPFS node is reachable."""
+        url = f"{self.config.kubo_api_url.rstrip('/')}/api/v0/id"
+        req = urllib.request.Request(url, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return resp.status == 200
@@ -199,8 +205,8 @@ class WeSenseArchiver:
         """
         logger.info("Starting archive cycle...")
 
-        if not self._check_orbitdb():
-            logger.warning("OrbitDB unreachable at %s — skipping cycle", self.config.orbitdb_url)
+        if not self._check_kubo():
+            logger.warning("Kubo unreachable at %s — skipping cycle", self.config.kubo_api_url)
             return
 
         # Clear staging directory to remove leftovers from previous failed uploads
@@ -299,42 +305,43 @@ class WeSenseArchiver:
         return dates
 
     def _get_archived_dates(self, country: str) -> set[str]:
-        """Check the IPFS tree for already-archived dates for a country.
+        """Check the Kubo MFS tree for already-archived dates for a country.
 
         Walks /{country}/{year}/{month}/{day}/ and returns a set of ISO date strings.
-        Returns empty set if OrbitDB is unreachable or tree is empty.
+        Returns empty set if Kubo is unreachable or tree is empty.
         """
         archived = set()
-        base_url = f"{self.config.orbitdb_url.rstrip('/')}/archives/tree"
 
         try:
-            # List years: GET /archives/tree/{country}
-            years = self._list_tree_entries(f"{base_url}/{country}")
+            # List years: /api/v0/files/ls?arg=/{country}
+            years = self._mfs_ls(f"/{country}")
             for year_entry in years:
-                year = year_entry["name"]
-                # List months: GET /archives/tree/{country}/{year}
-                months = self._list_tree_entries(f"{base_url}/{country}/{year}")
+                year = year_entry["Name"]
+                # List months
+                months = self._mfs_ls(f"/{country}/{year}")
                 for month_entry in months:
-                    month = month_entry["name"]
-                    # List days: GET /archives/tree/{country}/{year}/{month}
-                    days = self._list_tree_entries(f"{base_url}/{country}/{year}/{month}")
+                    month = month_entry["Name"]
+                    # List days
+                    days = self._mfs_ls(f"/{country}/{year}/{month}")
                     for day_entry in days:
-                        day = day_entry["name"]
+                        day = day_entry["Name"]
                         archived.add(f"{year}-{month}-{day}")
         except Exception as e:
-            logger.warning("Failed to query IPFS tree for %s: %s — will re-archive all", country, e)
+            logger.warning("Failed to query Kubo MFS for %s: %s — will re-archive all", country, e)
             return set()
 
         if archived:
-            logger.debug("%s: %d dates already archived in IPFS tree", country, len(archived))
+            logger.debug("%s: %d dates already archived in Kubo MFS", country, len(archived))
         return archived
 
-    def _list_tree_entries(self, url: str) -> list[dict]:
-        """Fetch directory entries from a tree URL. Returns entries with 'name' and 'type'."""
-        req = urllib.request.Request(url, method="GET")
+    def _mfs_ls(self, path: str) -> list[dict]:
+        """List directory entries in Kubo MFS. Returns entries with 'Name' and 'Type'."""
+        url = f"{self.config.kubo_api_url.rstrip('/')}/api/v0/files/ls?arg={urllib.parse.quote(path)}&long=true"
+        req = urllib.request.Request(url, method="POST")
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
-            return [e for e in data.get("entries", []) if e.get("type") == "directory"]
+            # Kubo returns {"Entries": [...]} with Type=1 for directories
+            return [e for e in (data.get("Entries") or []) if e.get("Type") == 1]
 
     def archive_period(self, period: str, region: str) -> dict:
         """
@@ -647,26 +654,93 @@ class WeSenseArchiver:
         return hashlib.sha256(concatenated.encode()).hexdigest()
 
     def _upload_to_ipfs(self) -> str | None:
-        """Upload staging directory to IPFS via POST /archives on wesense-orbitdb."""
-        url = f"{self.config.orbitdb_url.rstrip('/')}/archives"
-        data = json.dumps({"staging_dir": self.config.staging_dir}).encode()
-        headers = {"Content-Type": "application/json"}
+        """Upload staging directory to IPFS via Kubo MFS API.
 
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        Walks the local staging directory, writes each file to MFS at
+        the corresponding path, then reads back the root CID and publishes
+        it to IPNS for stable addressing.
+        """
+        staging = Path(self.config.staging_dir)
+        base_url = self.config.kubo_api_url.rstrip("/")
+
+        try:
+            # Walk staging dir and write each file to Kubo MFS
+            for file_path in sorted(staging.rglob("*")):
+                if not file_path.is_file():
+                    continue
+
+                rel_path = file_path.relative_to(staging)
+                mfs_path = f"/{rel_path}"
+
+                # Create parent directories in MFS
+                parent = f"/{rel_path.parent}"
+                if parent != "/.":
+                    mkdir_url = f"{base_url}/api/v0/files/mkdir?arg={urllib.parse.quote(parent)}&parents=true"
+                    req = urllib.request.Request(mkdir_url, method="POST")
+                    try:
+                        urllib.request.urlopen(req, timeout=30)
+                    except urllib.error.HTTPError:
+                        pass  # Directory may already exist
+
+                # Write file to MFS
+                file_data = file_path.read_bytes()
+                write_url = (
+                    f"{base_url}/api/v0/files/write"
+                    f"?arg={urllib.parse.quote(mfs_path)}"
+                    f"&create=true&parents=true&truncate=true"
+                )
+
+                # Kubo /api/v0/files/write expects multipart form data
+                boundary = "----WeSenseArchiver"
+                body = (
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="file"; filename="{rel_path.name}"\r\n'
+                    f"Content-Type: application/octet-stream\r\n\r\n"
+                ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
+
+                req = urllib.request.Request(
+                    write_url,
+                    data=body,
+                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=60)
+
+            # Get root CID from MFS
+            stat_url = f"{base_url}/api/v0/files/stat?arg=/"
+            req = urllib.request.Request(stat_url, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                stat_data = json.loads(resp.read().decode())
+                root_cid = stat_data.get("Hash", "")
+
+            if not root_cid:
+                logger.error("Kubo MFS stat returned no root CID")
+                return None
+
+            logger.info("IPFS upload successful — root CID: %s", root_cid)
+
+            # Publish root CID to IPNS for stable addressing
+            self._publish_ipns(root_cid)
+
+            return root_cid
+
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+            logger.error("IPFS upload to Kubo failed: %s", e)
+            return None
+
+    def _publish_ipns(self, root_cid: str):
+        """Publish the archive root CID to IPNS via Kubo API."""
+        base_url = self.config.kubo_api_url.rstrip("/")
+        url = f"{base_url}/api/v0/name/publish?arg=/ipfs/{root_cid}"
+        req = urllib.request.Request(url, method="POST")
 
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read().decode())
-                if result.get("ok"):
-                    cid = result.get("root_cid", "")
-                    logger.info("IPFS upload successful — root CID: %s", cid)
-                    return cid
-                else:
-                    logger.error("IPFS upload failed: %s", result)
-                    return None
+                ipns_name = result.get("Name", "")
+                logger.info("IPNS published: %s -> %s", ipns_name, root_cid)
         except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
-            logger.error("IPFS upload failed: %s", e)
-            return None
+            logger.warning("IPNS publish failed (archives still accessible by CID): %s", e)
 
     def _submit_attestation(self, manifest: dict, readings_hash: str):
         """Submit attestation to OrbitDB via PUT /attestations/:readings_hash."""
