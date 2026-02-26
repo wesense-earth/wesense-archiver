@@ -209,10 +209,15 @@ class WeSenseArchiver:
             logger.warning("Kubo unreachable at %s — skipping cycle", self.config.kubo_api_url)
             return
 
-        # Clear staging directory to remove leftovers from previous failed uploads
+        # Clear staging directory contents (leftovers from previous failed uploads).
+        # Remove contents only — the directory itself may be a Docker bind mount.
         staging = Path(self.config.staging_dir)
         if staging.exists():
-            shutil.rmtree(staging)
+            for child in staging.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
         staging.mkdir(parents=True, exist_ok=True)
 
         # Don't archive today — incomplete data would change readings_hash
