@@ -74,9 +74,14 @@ def sign_row(row, private_key):
     """
     ts = row[IDX_TIMESTAMP]
     if hasattr(ts, "timestamp"):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
         ts_unix = int(ts.timestamp())
     else:
-        ts_unix = int(datetime.fromisoformat(str(ts)).timestamp())
+        ts = datetime.fromisoformat(str(ts))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        ts_unix = int(ts.timestamp())
 
     payload_dict = {
         "data_source": row[IDX_DATA_SOURCE],

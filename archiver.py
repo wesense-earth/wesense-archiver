@@ -515,13 +515,20 @@ class WeSenseArchiver:
         readings = []
         for row in result.result_rows:
             reading = dict(zip(columns, row))
-            # Preserve unix timestamp for signature verification and reading_id
+            # Preserve unix timestamp for signature verification and reading_id.
+            # clickhouse-connect may return naive datetimes even for
+            # DateTime64(3, 'UTC') columns — force UTC to avoid local-tz errors.
             ts = reading["timestamp"]
             if hasattr(ts, "timestamp"):
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
                 reading["_ts_unix"] = int(ts.timestamp())
                 reading["timestamp"] = ts.isoformat()
             else:
-                reading["_ts_unix"] = int(datetime.fromisoformat(str(ts)).timestamp())
+                ts = datetime.fromisoformat(str(ts))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                reading["_ts_unix"] = int(ts.timestamp())
             reading["reading_id"] = generate_reading_id(
                 reading["device_id"], reading["_ts_unix"], reading["reading_type"], reading["value"]
             )
