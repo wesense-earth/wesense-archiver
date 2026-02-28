@@ -79,8 +79,11 @@ class ArchiverConfig:
     # Kubo (IPFS archive storage)
     kubo_api_url: str = "http://kubo:5001"
 
-    # OrbitDB (attestations + trust sync only)
+    # OrbitDB — attestation submission (may point to a remote primary hub)
     orbitdb_url: str = "http://wesense-orbitdb:5200"
+
+    # OrbitDB — trust sync (always local; replicates via libp2p peer sync)
+    orbitdb_trust_url: str = "http://wesense-orbitdb:5200"
 
     # Staging
     staging_dir: str = "data/staging"
@@ -111,6 +114,7 @@ class ArchiverConfig:
             trust_file=os.getenv("TRUST_FILE", "data/trust_list.json"),
             kubo_api_url=os.getenv("KUBO_API_URL", "http://kubo:5001"),
             orbitdb_url=os.getenv("ORBITDB_URL", "http://wesense-orbitdb:5200"),
+            orbitdb_trust_url=os.getenv("ORBITDB_TRUST_URL", "http://wesense-orbitdb:5200"),
             staging_dir=os.getenv("ARCHIVE_STAGING_DIR", "data/staging"),
             interval_hours=int(os.getenv("ARCHIVE_INTERVAL_HOURS", "4")),
             regions=regions,
@@ -167,7 +171,7 @@ class WeSenseArchiver:
         if _REGISTRY_AVAILABLE:
             try:
                 reg_config = RegistryConfig(
-                    url=self.config.orbitdb_url,
+                    url=self.config.orbitdb_trust_url,
                     enabled=True,
                     sync_interval=3600,
                 )
