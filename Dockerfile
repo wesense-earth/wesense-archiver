@@ -29,10 +29,12 @@ RUN apt-get update && \
 
 # Copy application code
 COPY wesense-archiver/archiver.py .
+COPY wesense-archiver/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Create directories for data, keys, staging
 RUN mkdir -p /app/data/keys /app/data/staging
 
 ENV TZ=UTC
 
-CMD ["python", "-u", "archiver.py"]
+ENTRYPOINT ["/app/entrypoint.sh"]
